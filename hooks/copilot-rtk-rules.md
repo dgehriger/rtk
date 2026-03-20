@@ -1,3 +1,6 @@
+---
+applyTo: "**"
+---
 # RTK - Rust Token Killer (GitHub Copilot)
 
 **Rule**: Always prefix shell commands with `rtk` to minimize token consumption.

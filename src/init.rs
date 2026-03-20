@@ -535,18 +535,29 @@ pub fn uninstall(
     }
 
     if copilot {
-        let instructions_path = PathBuf::from(".github/copilot-instructions.md");
+        let instructions_path = PathBuf::from(".github/instructions/rtk.instructions.md");
+        let legacy_path = PathBuf::from(".github/copilot-instructions.md");
+        let mut removed = Vec::new();
+
         if instructions_path.exists() {
             fs::remove_file(&instructions_path)
                 .with_context(|| format!("Failed to remove {}", instructions_path.display()))?;
-            if verbose > 0 {
-                eprintln!("Removed {}", instructions_path.display());
-            }
-            println!("\nRTK uninstalled (GitHub Copilot):");
-            println!("  - {}", instructions_path.display());
-            println!("\nNote: .github/hooks/rtk-rewrite.json was not removed (may be shared).");
-        } else {
+            removed.push(instructions_path.display().to_string());
+        }
+        if legacy_path.exists() {
+            fs::remove_file(&legacy_path)
+                .with_context(|| format!("Failed to remove {}", legacy_path.display()))?;
+            removed.push(legacy_path.display().to_string());
+        }
+
+        if removed.is_empty() {
             println!("RTK Copilot support was not installed in this project (nothing to remove)");
+        } else {
+            println!("\nRTK uninstalled (GitHub Copilot):");
+            for p in &removed {
+                println!("  - {}", p);
+            }
+            println!("\nNote: .github/hooks/rtk-rewrite.json was not removed (may be shared).");
         }
         return Ok(());
     }
@@ -1434,15 +1445,18 @@ fn run_cline_mode(verbose: u8) -> Result<()> {
 // ─── GitHub Copilot support ──────────────────────────────────────
 
 fn run_copilot_mode(verbose: u8) -> Result<()> {
-    // GitHub Copilot reads .github/copilot-instructions.md (project-scoped)
+    // GitHub Copilot reads .github/instructions/*.instructions.md (scoped instructions)
     // and .github/hooks/rtk-rewrite.json (PreToolUse hook)
     let github_dir = PathBuf::from(".github");
     let hooks_dir = github_dir.join("hooks");
-    let instructions_path = github_dir.join("copilot-instructions.md");
+    let instructions_dir = github_dir.join("instructions");
+    let instructions_path = instructions_dir.join("rtk.instructions.md");
     let hook_path = hooks_dir.join("rtk-rewrite.json");
 
     // Ensure directories exist
     fs::create_dir_all(&hooks_dir).context("Failed to create .github/hooks directory")?;
+    fs::create_dir_all(&instructions_dir)
+        .context("Failed to create .github/instructions directory")?;
 
     // 1. Install the hook (this is what actually rewrites commands)
     let hook_installed = if hook_path.exists() {
@@ -1459,6 +1473,7 @@ fn run_copilot_mode(verbose: u8) -> Result<()> {
     };
 
     // 2. Install lean instructions (soft layer — hook does the heavy lifting)
+    let legacy_path = github_dir.join("copilot-instructions.md");
     let existing = fs::read_to_string(&instructions_path).unwrap_or_default();
     if existing.contains("RTK") || existing.contains("rtk") {
         println!(
@@ -1472,7 +1487,7 @@ fn run_copilot_mode(verbose: u8) -> Result<()> {
             format!("{}\n\n{}", existing.trim(), COPILOT_INSTRUCTIONS)
         };
         fs::write(&instructions_path, &new_content)
-            .context("Failed to write .github/copilot-instructions.md")?;
+            .context("Failed to write .github/instructions/rtk.instructions.md")?;
 
         if verbose > 0 {
             eprintln!("Wrote {}", instructions_path.display());
@@ -1482,6 +1497,18 @@ fn run_copilot_mode(verbose: u8) -> Result<()> {
             "  Instructions: {} (installed)",
             instructions_path.display()
         );
+    }
+
+    // Migrate legacy .github/copilot-instructions.md if present
+    if legacy_path.exists() {
+        fs::remove_file(&legacy_path).ok();
+        if verbose > 0 {
+            eprintln!(
+                "Removed legacy {} (migrated to {})",
+                legacy_path.display(),
+                instructions_path.display()
+            );
+        }
     }
 
     if hook_installed {
