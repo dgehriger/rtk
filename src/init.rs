@@ -212,6 +212,7 @@ pub fn run(
     install_cursor: bool,
     install_windsurf: bool,
     install_cline: bool,
+    install_copilot: bool,
     claude_md: bool,
     hook_only: bool,
     codex: bool,
@@ -261,6 +262,11 @@ pub fn run(
         return run_cline_mode(verbose);
     }
 
+    // Copilot-only mode
+    if install_copilot {
+        return run_copilot_mode(verbose);
+    }
+
     // Mode selection (Claude Code / OpenCode)
     match (install_claude, install_opencode, claude_md, hook_only) {
         (false, true, _, _) => run_opencode_only_mode(verbose)?,
@@ -268,7 +274,7 @@ pub fn run(
         (true, opencode, false, true) => run_hook_only_mode(global, patch_mode, verbose, opencode)?,
         (true, opencode, false, false) => run_default_mode(global, patch_mode, verbose, opencode)?,
         (false, false, _, _) => {
-            if !install_cursor {
+            if !install_cursor && !install_copilot {
                 anyhow::bail!("at least one of install_claude or install_opencode must be true")
             }
         }
@@ -515,10 +521,34 @@ fn remove_hook_from_settings(verbose: u8) -> Result<bool> {
     Ok(removed)
 }
 
-/// Full uninstall for Claude, Gemini, Codex, or Cursor artifacts.
-pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose: u8) -> Result<()> {
+/// Full uninstall for Claude, Gemini, Codex, Cursor, or Copilot artifacts.
+pub fn uninstall(
+    global: bool,
+    gemini: bool,
+    codex: bool,
+    cursor: bool,
+    copilot: bool,
+    verbose: u8,
+) -> Result<()> {
     if codex {
         return uninstall_codex(global, verbose);
+    }
+
+    if copilot {
+        let instructions_path = PathBuf::from(".github/copilot-instructions.md");
+        if instructions_path.exists() {
+            fs::remove_file(&instructions_path)
+                .with_context(|| format!("Failed to remove {}", instructions_path.display()))?;
+            if verbose > 0 {
+                eprintln!("Removed {}", instructions_path.display());
+            }
+            println!("\nRTK uninstalled (GitHub Copilot):");
+            println!("  - {}", instructions_path.display());
+            println!("\nNote: .github/hooks/rtk-rewrite.json was not removed (may be shared).");
+        } else {
+            println!("RTK Copilot support was not installed in this project (nothing to remove)");
+        }
+        return Ok(());
     }
 
     if cursor {
@@ -1171,6 +1201,24 @@ const WINDSURF_RULES: &str = include_str!("../hooks/windsurf-rtk-rules.md");
 /// Embedded Cline RTK rules
 const CLINE_RULES: &str = include_str!("../hooks/cline-rtk-rules.md");
 
+/// Embedded GitHub Copilot RTK instructions (lean — the hook does the heavy lifting)
+const COPILOT_INSTRUCTIONS: &str = include_str!("../hooks/copilot-rtk-rules.md");
+
+/// Embedded VS Code Copilot hook JSON
+const COPILOT_HOOK_JSON: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "rtk hook",
+        "cwd": ".",
+        "timeout": 5
+      }
+    ]
+  }
+}
+"#;
+
 // ─── Cline / Roo Code support ─────────────────────────────────
 
 fn run_cline_mode(verbose: u8) -> Result<()> {
@@ -1197,6 +1245,70 @@ fn run_cline_mode(verbose: u8) -> Result<()> {
         println!("  Rules: .clinerules (installed)");
     }
     println!("  Cline will now use rtk commands for token savings.");
+    println!("  Test with: git status\n");
+
+    Ok(())
+}
+
+// ─── GitHub Copilot support ──────────────────────────────────────
+
+fn run_copilot_mode(verbose: u8) -> Result<()> {
+    // GitHub Copilot reads .github/copilot-instructions.md (project-scoped)
+    // and .github/hooks/rtk-rewrite.json (PreToolUse hook)
+    let github_dir = PathBuf::from(".github");
+    let hooks_dir = github_dir.join("hooks");
+    let instructions_path = github_dir.join("copilot-instructions.md");
+    let hook_path = hooks_dir.join("rtk-rewrite.json");
+
+    // Ensure directories exist
+    fs::create_dir_all(&hooks_dir).context("Failed to create .github/hooks directory")?;
+
+    // 1. Install the hook (this is what actually rewrites commands)
+    let hook_installed = if hook_path.exists() {
+        println!("\n  Hook: {} (already present)", hook_path.display());
+        false
+    } else {
+        fs::write(&hook_path, COPILOT_HOOK_JSON)
+            .context("Failed to write .github/hooks/rtk-rewrite.json")?;
+        if verbose > 0 {
+            eprintln!("Wrote {}", hook_path.display());
+        }
+        println!("\n  Hook: {} (installed)", hook_path.display());
+        true
+    };
+
+    // 2. Install lean instructions (soft layer — hook does the heavy lifting)
+    let existing = fs::read_to_string(&instructions_path).unwrap_or_default();
+    if existing.contains("RTK") || existing.contains("rtk") {
+        println!(
+            "  Instructions: {} (already present)",
+            instructions_path.display()
+        );
+    } else {
+        let new_content = if existing.trim().is_empty() {
+            COPILOT_INSTRUCTIONS.to_string()
+        } else {
+            format!("{}\n\n{}", existing.trim(), COPILOT_INSTRUCTIONS)
+        };
+        fs::write(&instructions_path, &new_content)
+            .context("Failed to write .github/copilot-instructions.md")?;
+
+        if verbose > 0 {
+            eprintln!("Wrote {}", instructions_path.display());
+        }
+
+        println!(
+            "  Instructions: {} (installed)",
+            instructions_path.display()
+        );
+    }
+
+    if hook_installed {
+        println!("\nRTK configured for GitHub Copilot.");
+    } else {
+        println!("\nRTK already configured for GitHub Copilot in this project.");
+    }
+    println!("  Copilot will now use rtk commands for token savings.");
     println!("  Test with: git status\n");
 
     Ok(())
@@ -2529,6 +2641,7 @@ More notes
             false,
             false,
             false,
+            false, // install_copilot
             false,
             false,
             true,
@@ -2551,6 +2664,7 @@ More notes
             false,
             false,
             false,
+            false, // install_copilot
             false,
             false,
             true,
