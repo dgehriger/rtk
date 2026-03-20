@@ -67,15 +67,24 @@ fn check_and_warn() -> Option<()> {
 
     eprintln!("{}", warning);
 
-    // Touch marker after warning is printed
+    // Touch marker after warning is printed.
+    // Write a non-empty payload so Windows updates the mtime (writing
+    // 0 bytes to an already-empty file does not update mtime on NTFS).
     let _ = std::fs::create_dir_all(marker.parent()?);
-    let _ = std::fs::write(&marker, b"");
+    let _ = std::fs::write(&marker, b"1");
 
     Some(())
 }
 
 pub fn parse_hook_version(content: &str) -> u8 {
-    // Version tag must be in the first 5 lines (shebang + header convention)
+    // JSON hook files (e.g. rtk-rewrite.json) are always current — they invoke
+    // `rtk hook` which is built into the binary, so there's no version skew.
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('{') {
+        return CURRENT_HOOK_VERSION;
+    }
+
+    // Shell hook: version tag must be in the first 5 lines (shebang + header convention)
     for line in content.lines().take(5) {
         if let Some(rest) = line.strip_prefix("# rtk-hook-version:") {
             if let Ok(v) = rest.trim().parse::<u8>() {
@@ -88,12 +97,27 @@ pub fn parse_hook_version(content: &str) -> u8 {
 
 fn hook_installed_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let path = home.join(".claude").join("hooks").join("rtk-rewrite.sh");
-    if path.exists() {
-        Some(path)
-    } else {
-        None
+
+    // Claude Code hook (Unix shell script)
+    let claude_hook = home.join(".claude").join("hooks").join("rtk-rewrite.sh");
+    if claude_hook.exists() {
+        return Some(claude_hook);
     }
+
+    // VS Code Copilot / Copilot CLI hook (cross-platform JSON config).
+    // Check both the current working directory and the home-level .github/hooks.
+    let copilot_hook_name = std::path::Path::new(".github")
+        .join("hooks")
+        .join("rtk-rewrite.json");
+    if copilot_hook_name.exists() {
+        return Some(copilot_hook_name.to_path_buf());
+    }
+    let home_copilot = home.join(&copilot_hook_name);
+    if home_copilot.exists() {
+        return Some(home_copilot);
+    }
+
+    None
 }
 
 fn warn_marker_path() -> Option<PathBuf> {
@@ -127,6 +151,12 @@ mod tests {
     fn test_parse_hook_version_no_tag() {
         assert_eq!(parse_hook_version("no version here"), 0);
         assert_eq!(parse_hook_version(""), 0);
+    }
+
+    #[test]
+    fn test_parse_hook_version_json_file() {
+        let content = r#"{ "hooks": { "PreToolUse": [{ "type": "command", "command": "rtk hook" }] } }"#;
+        assert_eq!(parse_hook_version(content), CURRENT_HOOK_VERSION);
     }
 
     #[test]

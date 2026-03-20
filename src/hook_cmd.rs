@@ -4,21 +4,26 @@ use std::io::{self, Read};
 
 use crate::discover::registry::rewrite_command;
 
-// ── Copilot hook (VS Code + Copilot CLI) ──────────────────────
+// ── Unified hook (auto-detects all agent formats) ─────────────
 
-/// Format detected from the preToolUse JSON input.
+/// Format detected from the preToolUse / BeforeTool JSON input.
 enum HookFormat {
     /// VS Code Copilot Chat / Claude Code: `tool_name` + `tool_input.command`, supports `updatedInput`.
     VsCode { command: String },
     /// GitHub Copilot CLI: camelCase `toolName` + `toolArgs` (JSON string), deny-with-suggestion only.
     CopilotCli { command: String },
+    /// Gemini CLI: `tool_name` = `"run_shell_command"` + `tool_input.command`.
+    Gemini { command: String },
     /// Non-bash tool, already uses rtk, or unknown format — pass through silently.
     PassThrough,
 }
 
-/// Run the Copilot preToolUse hook.
-/// Auto-detects VS Code Copilot Chat vs Copilot CLI format.
-pub fn run_copilot() -> Result<()> {
+/// Unified hook entry point: auto-detects VS Code Copilot, Copilot CLI, and Gemini CLI
+/// formats from stdin JSON and dispatches to the appropriate handler.
+///
+/// This is the recommended entry point — called when `rtk hook` is invoked without
+/// a subcommand (e.g. from `.github/hooks/rtk-rewrite.json`).
+pub fn run_auto() -> Result<()> {
     let mut input = String::new();
     io::stdin()
         .read_to_string(&mut input)
@@ -40,13 +45,34 @@ pub fn run_copilot() -> Result<()> {
     match detect_format(&v) {
         HookFormat::VsCode { command } => handle_vscode(&command),
         HookFormat::CopilotCli { command } => handle_copilot_cli(&command),
+        HookFormat::Gemini { command } => handle_gemini(&command),
         HookFormat::PassThrough => Ok(()),
     }
 }
 
+/// Run the Copilot preToolUse hook (explicit subcommand, delegates to auto-detect).
+pub fn run_copilot() -> Result<()> {
+    run_auto()
+}
+
 fn detect_format(v: &Value) -> HookFormat {
-    // VS Code Copilot Chat / Claude Code: snake_case keys
+    // snake_case `tool_name` key: VS Code Copilot Chat, Claude Code, or Gemini CLI
     if let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) {
+        // Gemini CLI: tool_name = "run_shell_command"
+        if tool_name == "run_shell_command" {
+            if let Some(cmd) = v
+                .pointer("/tool_input/command")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+            {
+                return HookFormat::Gemini {
+                    command: cmd.to_string(),
+                };
+            }
+            return HookFormat::PassThrough;
+        }
+
+        // VS Code Copilot Chat / Claude Code: Bash, bash, runTerminalCommand
         if matches!(tool_name, "runTerminalCommand" | "Bash" | "bash") {
             if let Some(cmd) = v
                 .pointer("/tool_input/command")
@@ -61,7 +87,7 @@ fn detect_format(v: &Value) -> HookFormat {
         return HookFormat::PassThrough;
     }
 
-    // Copilot CLI: camelCase keys, toolArgs is a JSON-encoded string
+    // camelCase `toolName` key: GitHub Copilot CLI
     if let Some(tool_name) = v.get("toolName").and_then(|t| t.as_str()) {
         if tool_name == "bash" {
             if let Some(tool_args_str) = v.get("toolArgs").and_then(|t| t.as_str()) {
@@ -139,40 +165,21 @@ fn handle_copilot_cli(cmd: &str) -> Result<()> {
 
 // ── Gemini hook ───────────────────────────────────────────────
 
-/// Run the Gemini CLI BeforeTool hook.
-/// Reads JSON from stdin, rewrites shell commands to rtk equivalents,
-/// outputs JSON to stdout in Gemini CLI format.
+/// Run the Gemini CLI BeforeTool hook (explicit subcommand, delegates to auto-detect).
 pub fn run_gemini() -> Result<()> {
-    let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
-        .context("Failed to read hook input from stdin")?;
+    run_auto()
+}
 
-    let json: Value = serde_json::from_str(&input).context("Failed to parse hook input as JSON")?;
+/// Handle a Gemini CLI command rewrite.
+fn handle_gemini(cmd: &str) -> Result<()> {
+    let excluded = crate::config::Config::load()
+        .map(|c| c.hooks.exclude_commands)
+        .unwrap_or_default();
 
-    let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-
-    if tool_name != "run_shell_command" {
-        print_allow();
-        return Ok(());
-    }
-
-    let cmd = json
-        .pointer("/tool_input/command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if cmd.is_empty() {
-        print_allow();
-        return Ok(());
-    }
-
-    // Delegate to the single source of truth for command rewriting
-    match rewrite_command(cmd, &[]) {
+    match rewrite_command(cmd, &excluded) {
         Some(rewritten) => print_rewrite(&rewritten),
         None => print_allow(),
     }
-
     Ok(())
 }
 
@@ -233,6 +240,43 @@ mod tests {
             HookFormat::CopilotCli { .. }
         ));
     }
+
+    // --- Gemini format detection ---
+
+    fn gemini_input(cmd: &str) -> Value {
+        json!({
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": cmd }
+        })
+    }
+
+    #[test]
+    fn test_detect_gemini_run_shell_command() {
+        assert!(matches!(
+            detect_format(&gemini_input("git status")),
+            HookFormat::Gemini { .. }
+        ));
+    }
+
+    #[test]
+    fn test_detect_gemini_empty_command_passthrough() {
+        let v = json!({
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": "" }
+        });
+        assert!(matches!(detect_format(&v), HookFormat::PassThrough));
+    }
+
+    #[test]
+    fn test_detect_gemini_non_shell_passthrough() {
+        let v = json!({
+            "tool_name": "read_file",
+            "tool_input": { "path": "/etc/hosts" }
+        });
+        assert!(matches!(detect_format(&v), HookFormat::PassThrough));
+    }
+
+    // --- General detection ---
 
     #[test]
     fn test_detect_non_bash_is_passthrough() {

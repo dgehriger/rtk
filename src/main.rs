@@ -690,10 +690,14 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Hook processors for LLM CLI tools (Gemini CLI, Copilot, etc.)
+    /// Hook processors for LLM CLI tools (auto-detects format from stdin JSON).
+    ///
+    /// Without a subcommand, auto-detects VS Code Copilot, Copilot CLI, Gemini CLI,
+    /// and Claude Code formats. Explicit subcommands (gemini, copilot) are kept as
+    /// aliases for backward compatibility.
     Hook {
         #[command(subcommand)]
-        command: HookCommands,
+        command: Option<HookCommands>,
     },
 }
 
@@ -1054,6 +1058,7 @@ const RTK_META_COMMANDS: &[&str] = &[
     "init",
     "config",
     "proxy",
+    "hook",
     "hook-audit",
     "cc-economics",
     "verify",
@@ -2038,11 +2043,15 @@ fn main() -> Result<()> {
         }
 
         Commands::Hook { command } => match command {
-            HookCommands::Gemini => {
+            Some(HookCommands::Gemini) => {
                 hook_cmd::run_gemini()?;
             }
-            HookCommands::Copilot => {
+            Some(HookCommands::Copilot) => {
                 hook_cmd::run_copilot()?;
+            }
+            None => {
+                // Auto-detect format from stdin JSON (recommended entry point)
+                hook_cmd::run_auto()?;
             }
         },
 
