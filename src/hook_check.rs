@@ -104,6 +104,16 @@ fn hook_installed_path() -> Option<PathBuf> {
         return Some(claude_hook);
     }
 
+    // Claude Code hook (Windows: `rtk hook` command in settings.json)
+    let settings_path = home.join(".claude").join("settings.json");
+    if settings_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if content.contains("rtk hook") || content.contains("rtk-rewrite") {
+                return Some(settings_path);
+            }
+        }
+    }
+
     // VS Code Copilot / Copilot CLI hook (cross-platform JSON config).
     // Check both the current working directory and the home-level .github/hooks.
     let copilot_hook_name = std::path::Path::new(".github")

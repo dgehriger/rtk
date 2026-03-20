@@ -880,24 +880,130 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
-            // Exact match OR both contain rtk-rewrite.sh
+            // Exact match OR both contain rtk-rewrite.sh OR both are rtk hook variants
             cmd == hook_command
                 || (cmd.contains("rtk-rewrite.sh") && hook_command.contains("rtk-rewrite.sh"))
+                || (cmd.starts_with("rtk hook") && hook_command.starts_with("rtk hook"))
         })
 }
 
 /// Default mode: hook + slim RTK.md + @RTK.md reference
 #[cfg(not(unix))]
 fn run_default_mode(
-    _global: bool,
-    _patch_mode: PatchMode,
-    _verbose: u8,
-    _install_opencode: bool,
+    global: bool,
+    patch_mode: PatchMode,
+    verbose: u8,
+    install_opencode: bool,
 ) -> Result<()> {
-    eprintln!("[warn] Hook-based mode requires Unix (macOS/Linux).");
-    eprintln!("    Windows: use --claude-md mode for full injection.");
-    eprintln!("    Falling back to --claude-md mode.");
-    run_claude_md_mode(_global, _verbose, _install_opencode)
+    if !global {
+        // Local init on Windows: inject CLAUDE.md (no hook)
+        return run_claude_md_mode(false, verbose, install_opencode);
+    }
+
+    // Global mode on Windows: use `rtk hook` as cross-platform hook command
+    // (no shell script needed — the binary handles everything)
+    let claude_dir = resolve_claude_dir()?;
+    let rtk_md_path = claude_dir.join("RTK.md");
+    let claude_md_path = claude_dir.join("CLAUDE.md");
+
+    // 1. Write RTK.md
+    write_if_changed(&rtk_md_path, RTK_SLIM, "RTK.md", verbose)?;
+
+    // 2. Patch CLAUDE.md (add @RTK.md, migrate if needed)
+    let migrated = patch_claude_md(&claude_md_path, verbose)?;
+
+    // 3. Patch settings.json with `rtk hook` as the hook command
+    let hook_command = "rtk hook";
+    let settings_path = claude_dir.join("settings.json");
+
+    let mut root = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)
+            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if hook_already_present(&root, hook_command) {
+        if verbose > 0 {
+            eprintln!("settings.json: hook already present");
+        }
+        println!("\nRTK hook already up to date (global).\n");
+    } else {
+        match patch_mode {
+            PatchMode::Skip => {
+                println!("\n  To manually add the hook to {}, add this to hooks.PreToolUse:", settings_path.display());
+                println!(r#"    {{ "matcher": "Bash", "hooks": [{{ "type": "command", "command": "rtk hook" }}] }}"#);
+                println!("\n  RTK.md:    {} (10 lines)", rtk_md_path.display());
+                println!("  CLAUDE.md: @RTK.md reference added\n");
+                return Ok(());
+            }
+            PatchMode::Ask => {
+                use std::io::{self, BufRead, IsTerminal};
+                if io::stdin().is_terminal() {
+                    eprint!(
+                        "Patch {} with RTK hook? [y/N] ",
+                        settings_path.display()
+                    );
+                    let line = io::stdin()
+                        .lock()
+                        .lines()
+                        .next()
+                        .unwrap_or(Ok(String::new()))
+                        .unwrap_or_default();
+                    if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+                        println!("\n  To manually add the hook to {}, add this to hooks.PreToolUse:", settings_path.display());
+                        println!(r#"    {{ "matcher": "Bash", "hooks": [{{ "type": "command", "command": "rtk hook" }}] }}"#);
+                        return Ok(());
+                    }
+                } else {
+                    // Non-interactive: skip patching
+                    return Ok(());
+                }
+            }
+            PatchMode::Auto => {}
+        }
+
+        // Backup original
+        if settings_path.exists() {
+            let backup_path = settings_path.with_extension("json.bak");
+            fs::copy(&settings_path, &backup_path)
+                .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+            if verbose > 0 {
+                eprintln!("Backup: {}", backup_path.display());
+            }
+        }
+
+        insert_hook_entry(&mut root, hook_command);
+        let serialized =
+            serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
+        atomic_write(&settings_path, &serialized)?;
+
+        println!("\nRTK hook installed (global).\n");
+        println!("  settings.json: hook added (`rtk hook`)");
+    }
+
+    println!("  RTK.md:    {} (10 lines)", rtk_md_path.display());
+    println!("  CLAUDE.md: @RTK.md reference added");
+
+    if migrated {
+        println!("\n  [ok] Migrated: removed old RTK block from CLAUDE.md");
+        println!("              replaced with @RTK.md (10 lines)");
+    }
+
+    if install_opencode {
+        println!("  Restart Claude Code and OpenCode. Test with: git status");
+    } else {
+        println!("  Restart Claude Code. Test with: git status");
+    }
+
+    println!();
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1036,12 +1142,87 @@ fn generate_global_filters_template(verbose: u8) -> Result<()> {
 /// Hook-only mode: just the hook, no RTK.md
 #[cfg(not(unix))]
 fn run_hook_only_mode(
-    _global: bool,
-    _patch_mode: PatchMode,
-    _verbose: u8,
+    global: bool,
+    patch_mode: PatchMode,
+    verbose: u8,
     _install_opencode: bool,
 ) -> Result<()> {
-    anyhow::bail!("Hook install requires Unix (macOS/Linux). Use WSL or --claude-md mode.")
+    if !global {
+        eprintln!("[warn] Warning: --hook-only only makes sense with --global");
+        eprintln!("    For local projects, use default mode or --claude-md");
+        return Ok(());
+    }
+
+    // Windows: use `rtk hook` as cross-platform hook command
+    let hook_command = "rtk hook";
+    let claude_dir = resolve_claude_dir()?;
+    let settings_path = claude_dir.join("settings.json");
+
+    let mut root = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)
+            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if hook_already_present(&root, hook_command) {
+        println!("\nRTK hook already up to date (hook-only mode).\n");
+        return Ok(());
+    }
+
+    if matches!(patch_mode, PatchMode::Skip) {
+        println!("\n  To manually add the hook to {}, add this to hooks.PreToolUse:", settings_path.display());
+        println!(r#"    {{ "matcher": "Bash", "hooks": [{{ "type": "command", "command": "rtk hook" }}] }}"#);
+        return Ok(());
+    }
+
+    if matches!(patch_mode, PatchMode::Ask) {
+        use std::io::{self, BufRead, IsTerminal};
+        if io::stdin().is_terminal() {
+            eprint!("Patch {} with RTK hook? [y/N] ", settings_path.display());
+            let line = io::stdin()
+                .lock()
+                .lines()
+                .next()
+                .unwrap_or(Ok(String::new()))
+                .unwrap_or_default();
+            if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+    }
+
+    // Backup original
+    if settings_path.exists() {
+        let backup_path = settings_path.with_extension("json.bak");
+        fs::copy(&settings_path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup_path.display());
+        }
+    }
+
+    insert_hook_entry(&mut root, hook_command);
+    let serialized =
+        serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
+    atomic_write(&settings_path, &serialized)?;
+
+    println!("\nRTK hook installed (hook-only mode).\n");
+    println!("  Hook: `rtk hook` added to settings.json");
+    println!(
+        "  Note: No RTK.md created. Claude won't know about meta commands (gain, discover, proxy)."
+    );
+    println!("  Restart Claude Code. Test with: git status\n");
+
+    Ok(())
 }
 
 #[cfg(unix)]
