@@ -72,8 +72,11 @@ fn detect_format(v: &Value) -> HookFormat {
             return HookFormat::PassThrough;
         }
 
-        // VS Code Copilot Chat / Claude Code: Bash, bash, runTerminalCommand
-        if matches!(tool_name, "runTerminalCommand" | "Bash" | "bash") {
+        // VS Code Copilot Chat / Claude Code: Bash, bash, runTerminalCommand, run_in_terminal
+        if matches!(
+            tool_name,
+            "runTerminalCommand" | "run_in_terminal" | "Bash" | "bash"
+        ) {
             if let Some(cmd) = v
                 .pointer("/tool_input/command")
                 .and_then(|c| c.as_str())
@@ -229,6 +232,14 @@ mod tests {
     fn test_detect_vscode_run_terminal_command() {
         assert!(matches!(
             detect_format(&vscode_input("runTerminalCommand", "cargo test")),
+            HookFormat::VsCode { .. }
+        ));
+    }
+
+    #[test]
+    fn test_detect_vscode_run_in_terminal() {
+        assert!(matches!(
+            detect_format(&vscode_input("run_in_terminal", "git status")),
             HookFormat::VsCode { .. }
         ));
     }
