@@ -7,9 +7,13 @@ use crate::discover::registry::rewrite_command;
 // ── Unified hook (auto-detects all agent formats) ─────────────
 
 /// Format detected from the preToolUse / BeforeTool JSON input.
+#[derive(Debug)]
 enum HookFormat {
     /// VS Code Copilot Chat / Claude Code: `tool_name` + `tool_input.command`, supports `updatedInput`.
-    VsCode { command: String },
+    VsCode {
+        command: String,
+        tool_input: Value,
+    },
     /// GitHub Copilot CLI: camelCase `toolName` + `toolArgs` (JSON string), deny-with-suggestion only.
     CopilotCli { command: String },
     /// Gemini CLI: `tool_name` = `"run_shell_command"` + `tool_input.command`.
@@ -43,7 +47,10 @@ pub fn run_auto() -> Result<()> {
     };
 
     match detect_format(&v) {
-        HookFormat::VsCode { command } => handle_vscode(&command),
+        HookFormat::VsCode {
+            command,
+            tool_input,
+        } => handle_vscode(&command, &tool_input),
         HookFormat::CopilotCli { command } => handle_copilot_cli(&command),
         HookFormat::Gemini { command } => handle_gemini(&command),
         HookFormat::PassThrough => Ok(()),
@@ -82,8 +89,13 @@ fn detect_format(v: &Value) -> HookFormat {
                 .and_then(|c| c.as_str())
                 .filter(|c| !c.is_empty())
             {
+                let tool_input = v
+                    .get("tool_input")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"command": cmd}));
                 return HookFormat::VsCode {
                     command: cmd.to_string(),
+                    tool_input,
                 };
             }
         }
@@ -131,18 +143,25 @@ fn get_rewritten(cmd: &str) -> Option<String> {
     Some(rewritten)
 }
 
-fn handle_vscode(cmd: &str) -> Result<()> {
+fn handle_vscode(cmd: &str, tool_input: &Value) -> Result<()> {
     let rewritten = match get_rewritten(cmd) {
         Some(r) => r,
         None => return Ok(()),
     };
+
+    // Preserve all original tool_input fields, only override "command".
+    // VS Code ignores updatedInput if it doesn't match the tool's schema.
+    let mut updated = tool_input.clone();
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert("command".to_string(), json!(rewritten));
+    }
 
     let output = json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
             "permissionDecisionReason": "RTK auto-rewrite",
-            "updatedInput": { "command": rewritten }
+            "updatedInput": updated
         }
     });
     println!("{output}");
@@ -384,5 +403,54 @@ mod tests {
             rewrite_command("RUST_LOG=debug cargo test", &[]),
             Some("RUST_LOG=debug rtk cargo test".into())
         );
+    }
+
+    // --- VS Code updatedInput preservation ---
+
+    #[test]
+    fn test_detect_vscode_captures_full_tool_input() {
+        let v = json!({
+            "tool_name": "run_in_terminal",
+            "tool_input": {
+                "command": "cargo build --release",
+                "explanation": "Build release binary",
+                "goal": "Build",
+                "isBackground": false,
+                "timeout": 120000
+            }
+        });
+        match detect_format(&v) {
+            HookFormat::VsCode { command, tool_input } => {
+                assert_eq!(command, "cargo build --release");
+                assert_eq!(tool_input["explanation"], "Build release binary");
+                assert_eq!(tool_input["goal"], "Build");
+                assert_eq!(tool_input["isBackground"], false);
+                assert_eq!(tool_input["timeout"], 120000);
+            }
+            other => panic!("Expected VsCode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vscode_updated_input_preserves_all_fields() {
+        let tool_input = json!({
+            "command": "cargo build --release",
+            "explanation": "Build release binary",
+            "goal": "Build",
+            "isBackground": false,
+            "timeout": 120000
+        });
+
+        // Simulate handle_vscode logic: clone + override command
+        let mut updated = tool_input.clone();
+        if let Some(obj) = updated.as_object_mut() {
+            obj.insert("command".to_string(), json!("rtk cargo build --release"));
+        }
+
+        assert_eq!(updated["command"], "rtk cargo build --release");
+        assert_eq!(updated["explanation"], "Build release binary");
+        assert_eq!(updated["goal"], "Build");
+        assert_eq!(updated["isBackground"], false);
+        assert_eq!(updated["timeout"], 120000);
     }
 }
